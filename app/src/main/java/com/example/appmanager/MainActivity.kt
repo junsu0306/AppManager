@@ -2,21 +2,24 @@ package com.example.appmanager
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlarmManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.TimePickerDialog
-import android.app.admin.DevicePolicyManager
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
+import android.util.Log
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.Spinner
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.util.*
 
@@ -24,11 +27,6 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var appSpinner: Spinner
     private lateinit var timeTriggerButton: Button
-    private lateinit var locationTriggerButton: Button
-    private lateinit var adminButton: Button
-
-    private lateinit var devicePolicyManager: DevicePolicyManager
-    private lateinit var compName: ComponentName
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,54 +34,38 @@ class MainActivity : AppCompatActivity() {
 
         appSpinner = findViewById(R.id.appSpinner)
         timeTriggerButton = findViewById(R.id.timeTriggerButton)
-        locationTriggerButton = findViewById(R.id.locationTriggerButton)
-        adminButton = findViewById(R.id.adminButton)
 
-        devicePolicyManager = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-        compName = ComponentName(this, MyDeviceAdminReceiver::class.java)
+        // 알림 권한 체크 및 요청
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 100)
+            }
+        }
 
+        // 앱 초기화
         loadInstalledApps()
-
         timeTriggerButton.setOnClickListener { showTimePickerDialog() }
-        locationTriggerButton.setOnClickListener { requestLocationPermission() }
-        adminButton.setOnClickListener { requestDeviceAdminPermission() }
 
-        if (checkLocationPermission()) {
-            requestBatteryOptimizationException()
-            startAppManagerService()
-        } else {
-            requestLocationPermission()
+        // 포그라운드 서비스 시작
+        startAppManagerService()
+    }
+
+    // 권한 요청 결과 처리
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 100) { // 알림 권한 결과
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(this, "알림 권한이 허용되었습니다.", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "알림 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
-    private fun checkLocationPermission(): Boolean {
-        return ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun startAppManagerService() {
-        val serviceIntent = Intent(this, AppManagerService::class.java)
-        startForegroundService(serviceIntent)
-    }
-
-    private val deviceAdminLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        if (result.resultCode == RESULT_OK) {
-            Toast.makeText(this, "기기 관리자 권한이 활성화되었습니다.", Toast.LENGTH_SHORT).show()
-        } else {
-            Toast.makeText(this, "기기 관리자 권한을 활성화하지 않았습니다.", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    private fun requestDeviceAdminPermission() {
-        val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
-        intent.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, compName)
-        intent.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "기기 관리자 권한을 부여하세요.")
-        deviceAdminLauncher.launch(intent)
-    }
-
-    @SuppressLint("QueryPermissionsNeeded")
+    // 앱 목록 로드
     private fun loadInstalledApps() {
         val pm: PackageManager = packageManager
         val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
@@ -94,6 +76,7 @@ class MainActivity : AppCompatActivity() {
         appSpinner.adapter = adapter
     }
 
+    // 시간 선택 다이얼로그 표시 및 알람 설정
     private fun showTimePickerDialog() {
         val calendar = Calendar.getInstance()
         val timePickerDialog = TimePickerDialog(this, { _, hourOfDay, minute ->
@@ -103,68 +86,72 @@ class MainActivity : AppCompatActivity() {
         timePickerDialog.show()
     }
 
+    @SuppressLint("ScheduleExactAlarm")
     private fun setAppLaunchTrigger(hour: Int, minute: Int) {
         val selectedAppPackage = appSpinner.selectedItem as String
         val calendar = Calendar.getInstance()
-        val currentTime = calendar.timeInMillis
 
         calendar.set(Calendar.HOUR_OF_DAY, hour)
         calendar.set(Calendar.MINUTE, minute)
-        val triggerTime = calendar.timeInMillis
+        calendar.set(Calendar.SECOND, 0)
 
-        if (triggerTime <= currentTime) {
-            Toast.makeText(this, "트리거 시간이 현재 시간보다 늦어야 합니다.", Toast.LENGTH_SHORT).show()
-            return
+        if (calendar.timeInMillis <= System.currentTimeMillis()) {
+            calendar.add(Calendar.DAY_OF_MONTH, 1) // 트리거 시간이 이미 지났다면 다음 날로 설정
         }
 
-        val timer = Timer()
-        timer.schedule(object : TimerTask() {
-            override fun run() {
-                launchApp(selectedAppPackage)
-            }
-        }, triggerTime - currentTime)
-    }
-
-    private fun launchApp(packageName: String) {
-        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-        if (launchIntent != null) {
-            startActivity(launchIntent)
-        } else {
-            Toast.makeText(this, "앱을 실행할 수 없습니다.", Toast.LENGTH_SHORT).show()
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(this, AlarmReceiver::class.java).apply {
+            putExtra("appPackage", selectedAppPackage)
         }
+        val pendingIntent = PendingIntent.getBroadcast(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, calendar.timeInMillis, pendingIntent)
+        Log.d("MainActivity", "Alarm set for: ${calendar.time}")
+
+        // 예약 내역 알림 표시
+        showNotification(selectedAppPackage, calendar)
     }
 
-    private fun requestLocationPermission() {
-        if (!checkLocationPermission()) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
-        } else {
-            setLocationTrigger()
-            startAppManagerService()
+    // 알림 표시
+    private fun showNotification(appPackage: String, calendar: Calendar) {
+        val channelId = "app_trigger_channel"
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        // Android 8.0 이상에서는 알림 채널이 필요
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "App Trigger Notifications",
+                NotificationManager.IMPORTANCE_DEFAULT
+            )
+            notificationManager.createNotificationChannel(channel)
         }
+
+        val formattedTime = "${calendar.get(Calendar.HOUR_OF_DAY)}:${String.format("%02d", calendar.get(Calendar.MINUTE))}"
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setSmallIcon(R.drawable.ic_notification_icon)
+            .setContentTitle("예약된 앱 트리거")
+            .setContentText("앱: $appPackage, 예약 시간: $formattedTime")
+            .setAutoCancel(true)
+            .build()
+
+        notificationManager.notify(1, notification)
     }
 
-    private fun requestBatteryOptimizationException() {
-        val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-        startActivity(intent)
-        Toast.makeText(this, "배터리 최적화 예외 설정을 해주세요.", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun setLocationTrigger() {
-        Toast.makeText(this, "위치 트리거가 설정되었습니다.", Toast.LENGTH_SHORT).show()
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            setLocationTrigger()
-            requestBatteryOptimizationException()
-            startAppManagerService()
-        } else {
-            Toast.makeText(this, "위치 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
-        }
+    // 포그라운드 서비스 시작
+    private fun startAppManagerService() {
+        val serviceIntent = Intent(this, AppManagerService::class.java)
+        ContextCompat.startForegroundService(this, serviceIntent)
     }
 }
+
+
+
+
 
 
